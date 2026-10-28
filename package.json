@@ -1,0 +1,6 @@
+{
+  "name": "tg-copy-bot",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node test.mjs" }
+}
