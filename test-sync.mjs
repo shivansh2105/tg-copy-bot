@@ -1,5 +1,5 @@
 // Edit-sync + /del test with fake Durable Objects: node test-sync.mjs
-import { handleUpdate, AlbumBuffer, Store } from "./worker.js";
+import { handleUpdate, AlbumBuffer, Store, checkDeleted } from "./worker.js";
 import assert from "node:assert";
 
 const SRC = -1004396657933, DST = "-1001549839446";
@@ -22,6 +22,7 @@ function makeStorage() {
     put: async (o) => { for (const [k, v] of Object.entries(o)) m.set(k, structuredClone(v)); },
     delete: async (ks) => ks.forEach((k) => m.delete(k)),
     deleteAll: async () => m.clear(),
+    list: async ({ prefix }) => new Map([...m].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k, structuredClone(v)])),
     setAlarm: async () => {},
   };
 }
@@ -81,5 +82,28 @@ calls.length = 0;
 // 7. edit after delete -> nothing happens; /del is never copied
 await handleUpdate({ edited_channel_post: { message_id: 10, chat: chan, text: "x" } }, env, api);
 assert.strictEqual(calls.length, 0);
+
+// 8. cron: posts 40 (exists) and 41 (deleted normally) -> only 41's copy removed
+await handleUpdate({ channel_post: { message_id: 40, chat: chan, text: "keep" } }, env, api);
+await handleUpdate({ channel_post: { message_id: 41, chat: chan, text: "gone", reply_markup: { inline_keyboard: [] } } }, env, api);
+const copy41 = calls.pop()[1] && nextId - 1;
+calls.length = 0;
+const cronApi = async (m, b) => {
+  calls.push([m, b]);
+  if (m === "editMessageReplyMarkup") {
+    return b.message_id === 41
+      ? { ok: false, description: "Bad Request: message to edit not found" }
+      : { ok: false, description: "Bad Request: message is not modified" };
+  }
+  return { ok: true };
+};
+await checkDeleted(env, cronApi);
+const checks = calls.filter(([m]) => m === "editMessageReplyMarkup");
+assert.deepStrictEqual(checks.map(([, b]) => b.message_id), [41, 40, 11]); // newest first (11 = photo from step 3)
+assert.deepStrictEqual(checks[0][1].reply_markup, { inline_keyboard: [] }); // buttons preserved
+assert.deepStrictEqual(calls.find(([m]) => m === "deleteMessages"), ["deleteMessages", { chat_id: DST, message_ids: [copy41] }]);
+calls.length = 0;
+await checkDeleted(env, cronApi); // 41 forgotten, 41 forgotten
+assert.deepStrictEqual(calls.map(([, b]) => b.message_id), [40, 11]);
 
 console.log("sync tests passed");

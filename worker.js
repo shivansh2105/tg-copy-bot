@@ -6,6 +6,8 @@
 // - Edits in the source are mirrored to the copy.
 // - Reply "/del" to a source post (or "/del <post link>") -> deletes the copy,
 //   the original and the /del message.
+// - Every minute a cron checks recent originals; if one was deleted normally,
+//   its copy is deleted too.
 //
 // Secrets (npx wrangler secret put NAME):
 //   BOT_TOKEN       token from @BotFather
@@ -52,7 +54,54 @@ export default {
 
     return new Response("Telegram copy bot is running.");
   },
+
+  // Cron (every minute, see wrangler.toml): notice deleted source posts.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkDeleted(env, makeApi(env.BOT_TOKEN)).catch((e) => console.log("cron error", e)));
+  },
 };
+
+const RECENT_MS = 48 * 3600 * 1000; // bots can only delete messages younger than 48 h
+const MAX_CHECKS = 35; // stays under the free plan's 50 subrequests per run
+
+// Telegram never tells bots about deletions, so we ask: "edit" each recent
+// original's buttons to exactly what they already are. Telegram answers
+// "not modified" if the post exists, "not found" if it was deleted.
+export async function checkDeleted(env, api) {
+  if (!env.STORE) return;
+  const now = Date.now();
+  let budget = MAX_CHECKS;
+
+  for (const src of Object.keys(parseRoutes(env.ROUTES))) {
+    if (budget <= 0) break;
+    const s = store(env, src);
+    const recent = Object.entries(await s.list("r:")).map(([k, v]) => [Number(k.slice(2)), v]);
+    const old = recent.filter(([, v]) => now - v.t > RECENT_MS).map(([id]) => `r:${id}`);
+    if (old.length) await s.del(old);
+
+    const fresh = recent.filter(([, v]) => now - v.t <= RECENT_MS).sort((a, b) => b[0] - a[0]);
+    const gone = [];
+    for (const [id, v] of fresh.slice(0, budget)) {
+      budget--;
+      const res = await api("editMessageReplyMarkup", {
+        chat_id: src,
+        message_id: id,
+        reply_markup: v.kb,
+      });
+      if (!res.ok && /not found/i.test(res.description || "")) gone.push(id);
+    }
+    if (!gone.length) continue;
+
+    const keys = gone.map((id) => `m:${id}`);
+    const found = await s.get(keys);
+    const byChat = {};
+    for (const k of keys) for (const c of found[k] || []) (byChat[c.chat] ||= []).push(c.id);
+    for (const [chat, ids] of Object.entries(byChat)) {
+      await api("deleteMessages", { chat_id: chat, message_ids: ids });
+    }
+    await s.del([...keys, ...gone.map((id) => `r:${id}`), ...gone.map((id) => `g:${id}`)]);
+  }
+}
 
 export function makeApi(token) {
   return async (method, body) => {
@@ -148,7 +197,10 @@ export async function handleUpdate(update, env, api) {
     if (res.ok && res.result) copies.push({ chat: dest, id: res.result.message_id });
   }
   if (copies.length && env.STORE) {
-    await store(env, chatId).put({ [`m:${msg.message_id}`]: copies });
+    await store(env, chatId).put({
+      [`m:${msg.message_id}`]: copies,
+      [`r:${msg.message_id}`]: { t: Date.now(), kb: msg.reply_markup },
+    });
   }
 }
 
@@ -159,6 +211,12 @@ async function syncEdit(msg, env, api) {
   const copies = (await store(env, String(msg.chat.id)).get([key]))[key];
   if (!copies) return;
   const mediaType = EDITABLE_MEDIA.find((t) => msg[t]);
+
+  // keep the remembered buttons current so the deletion check never changes them
+  const s = store(env, String(msg.chat.id));
+  const rKey = `r:${msg.message_id}`;
+  const r = (await s.get([rKey]))[rKey];
+  if (r) await s.put({ [rKey]: { t: r.t, kb: msg.reply_markup } });
 
   for (const c of copies) {
     const target = { chat_id: c.chat, message_id: c.id };
@@ -214,7 +272,7 @@ async function deleteCopies(msg, arg, env, api) {
   }
   // remove the original post(s) and the /del command itself
   await api("deleteMessages", { chat_id: msg.chat.id, message_ids: [...srcIds, msg.message_id] });
-  await s.del([...keys, ...srcIds.map((id) => `g:${id}`)]);
+  await s.del([...keys, ...srcIds.map((id) => `g:${id}`), ...srcIds.map((id) => `r:${id}`)]);
 }
 
 // Small key-value store (one Durable Object per source chat) that remembers
@@ -227,6 +285,7 @@ export function store(env, chatId) {
     get: (keys) => call("get", { keys }),
     put: (entries) => call("put", { entries }),
     del: (keys) => call("del", { keys }),
+    list: (prefix) => call("list", { prefix }),
   };
 }
 
@@ -239,6 +298,9 @@ export class Store {
     const op = new URL(request.url).pathname.slice(1);
     const body = await request.json();
     if (op === "get") return Response.json(Object.fromEntries(await this.storage.get(body.keys)));
+    if (op === "list") {
+      return Response.json(Object.fromEntries(await this.storage.list({ prefix: body.prefix })));
+    }
     if (op === "put") await this.storage.put(body.entries);
     else if (op === "del") await this.storage.delete(body.keys);
     else return new Response("bad op", { status: 400 });
@@ -288,6 +350,7 @@ export class AlbumBuffer {
           .filter(([, r]) => r[i])
           .map(([dest, r]) => ({ chat: dest, id: r[i].message_id }));
         entries[`g:${id}`] = ids;
+        entries[`r:${id}`] = { t: Date.now() }; // albums can't have buttons
       });
       await store(this.env, chatId).put(entries);
     }
