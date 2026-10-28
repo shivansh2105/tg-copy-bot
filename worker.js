@@ -102,11 +102,59 @@ export async function handleUpdate(update, env, api) {
 
   if (text.startsWith("/")) return; // don't copy bot commands
 
+  // Album: Telegram sends each photo separately. Collect them in a Durable
+  // Object for ALBUM_WAIT_MS, then copy them together so they stay one album.
+  if (msg.media_group_id && env.ALBUMS) {
+    const key = `${chatId}:${msg.media_group_id}`;
+    const stub = env.ALBUMS.get(env.ALBUMS.idFromName(key));
+    await stub.fetch("https://album/add", {
+      method: "POST",
+      body: JSON.stringify({ chatId, messageId: msg.message_id }),
+    });
+    return;
+  }
+
   for (const dest of dests) {
     await api("copyMessage", {
       chat_id: dest,
       from_chat_id: msg.chat.id,
       message_id: msg.message_id,
     });
+  }
+}
+
+const ALBUM_WAIT_MS = 2000;
+
+// One instance per album. Buffers message ids, then sends them with
+// copyMessages (keeps the album grouped, no sender name).
+export class AlbumBuffer {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const { chatId, messageId } = await request.json();
+    const ids = (await this.state.storage.get("ids")) || [];
+    if (!ids.includes(messageId)) ids.push(messageId);
+    await this.state.storage.put({ ids, chatId });
+    // restart the timer on every new photo; fires when the album is complete
+    await this.state.storage.setAlarm(Date.now() + ALBUM_WAIT_MS);
+    return new Response("queued");
+  }
+
+  async alarm() {
+    const ids = ((await this.state.storage.get("ids")) || []).sort((a, b) => a - b);
+    const chatId = await this.state.storage.get("chatId");
+    await this.state.storage.deleteAll();
+    if (!ids.length || !chatId) return;
+    const api = this.api || makeApi(this.env.BOT_TOKEN);
+    for (const dest of parseRoutes(this.env.ROUTES)[chatId] || []) {
+      await api("copyMessages", {
+        chat_id: dest,
+        from_chat_id: Number(chatId),
+        message_ids: ids,
+      });
+    }
   }
 }

@@ -2,5 +2,5 @@
   "name": "tg-copy-bot",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node test.mjs" }
+  "scripts": { "test": "node test.mjs && node test-album.mjs" }
 }
