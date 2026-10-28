@@ -89,6 +89,20 @@ export async function handleUpdate(update, env, api) {
     return;
   }
 
+  // Forward any channel post to the bot in private chat -> it replies with that
+  // channel's ID (no need to post /id in the channel).
+  if (msg.chat.type === "private") {
+    const origin = msg.forward_origin;
+    const fwdChat = (origin && (origin.chat || origin.sender_chat)) || msg.forward_from_chat;
+    if (fwdChat) {
+      await api("sendMessage", {
+        chat_id: msg.chat.id,
+        text: `"${fwdChat.title || "chat"}" ID: ${fwdChat.id}`,
+      });
+    }
+    return;
+  }
+
   const dests = parseRoutes(env.ROUTES)[chatId];
   if (!dests) return; // not a source chat
 

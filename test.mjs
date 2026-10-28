@@ -32,6 +32,10 @@ assert.strictEqual(calls.length, 0);
 await handleUpdate({ message: { message_id: 10, chat: { id: -1005, type: "group" }, from: { id: 42 }, text: "/id@MyBot" } }, env, api);
 assert.match(calls.pop()[1].text, /Chat ID: -1005/);
 
+// forwarded channel post in private chat -> replies with channel ID
+await handleUpdate({ message: { message_id: 11, chat: { id: 42, type: "private" }, from: { id: 42 }, forward_origin: { type: "channel", chat: { id: -1007, title: "News" } } } }, env, api);
+assert.match(calls.pop()[1].text, /"News" ID: -1007/);
+
 // webhook rejects wrong secret
 const bad = await worker.fetch(new Request("https://w.dev/webhook", { method: "POST", body: "{}" }), env, { waitUntil() {} });
 assert.strictEqual(bad.status, 403);
