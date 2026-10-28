@@ -36,6 +36,16 @@ npx wrangler secret put OWNER_ID  # optional: your user ID, only your posts get 
 ```
 Done. Post in Group A/B → appears in the channel with no sender name.
 
+## Edit & delete
+| You do in the source | What happens in the copy |
+|---|---|
+| Edit text / caption / swap photo | copy is edited the same way (automatic) |
+| Reply `/del` to a post | copy **and** original (and the /del message) are deleted |
+| `/del <post link>` | same, if you can't reply |
+| Delete normally | copy stays (Telegram does not tell bots about deletions) |
+
+The bot needs **Delete messages** permission in the source chat for `/del` to remove the original. Telegram only lets bots delete messages less than 48 h old. Copies made before this feature was deployed can't be edited/deleted by the bot.
+
 ## How albums work
 Telegram delivers each album photo as a separate message. The bot buffers them per album in a Durable Object (free plan), waits 2 s after the last photo, then sends them together with `copyMessages`.
 

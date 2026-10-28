@@ -7,7 +7,15 @@ keep_vars = true
 name = "ALBUMS"
 class_name = "AlbumBuffer"
 
+[[durable_objects.bindings]]
+name = "STORE"
+class_name = "Store"
+
 # new_sqlite_classes = free-plan compatible Durable Objects
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AlbumBuffer"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Store"]
