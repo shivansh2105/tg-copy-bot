@@ -57,50 +57,20 @@ export default {
 
   // Cron (every minute, see wrangler.toml): notice deleted source posts.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkDeleted(env, makeApi(env.BOT_TOKEN)).catch((e) => console.log("cron error", e)));
+    ctx.waitUntil(checkDeleted(env).catch((e) => console.log("cron error", e)));
   },
 };
 
 const RECENT_MS = 48 * 3600 * 1000; // bots can only delete messages younger than 48 h
-const MAX_CHECKS = 35; // stays under the free plan's 50 subrequests per run
+const SWEEP_BATCH = 40; // checks per run (free plan allows 50 outside requests per run)
+const SWEEP_GAP_MS = 2000; // pause between batches; each batch is a fresh run
 
-// Telegram never tells bots about deletions, so we ask: "edit" each recent
-// original's buttons to exactly what they already are. Telegram answers
-// "not modified" if the post exists, "not found" if it was deleted.
-export async function checkDeleted(env, api) {
+// Telegram never tells bots about deletions, so every minute each source chat's
+// Store object "sweeps" all originals from the last 48 h in batches of 40
+// (see Store.alarm). The cron only kicks it off.
+export async function checkDeleted(env) {
   if (!env.STORE) return;
-  const now = Date.now();
-  let budget = MAX_CHECKS;
-
-  for (const src of Object.keys(parseRoutes(env.ROUTES))) {
-    if (budget <= 0) break;
-    const s = store(env, src);
-    const recent = Object.entries(await s.list("r:")).map(([k, v]) => [Number(k.slice(2)), v]);
-    const old = recent.filter(([, v]) => now - v.t > RECENT_MS).map(([id]) => `r:${id}`);
-    if (old.length) await s.del(old);
-
-    const fresh = recent.filter(([, v]) => now - v.t <= RECENT_MS).sort((a, b) => b[0] - a[0]);
-    const gone = [];
-    for (const [id, v] of fresh.slice(0, budget)) {
-      budget--;
-      const res = await api("editMessageReplyMarkup", {
-        chat_id: src,
-        message_id: id,
-        reply_markup: v.kb,
-      });
-      if (!res.ok && /not found/i.test(res.description || "")) gone.push(id);
-    }
-    if (!gone.length) continue;
-
-    const keys = gone.map((id) => `m:${id}`);
-    const found = await s.get(keys);
-    const byChat = {};
-    for (const k of keys) for (const c of found[k] || []) (byChat[c.chat] ||= []).push(c.id);
-    for (const [chat, ids] of Object.entries(byChat)) {
-      await api("deleteMessages", { chat_id: chat, message_ids: ids });
-    }
-    await s.del([...keys, ...gone.map((id) => `r:${id}`), ...gone.map((id) => `g:${id}`)]);
-  }
+  for (const src of Object.keys(parseRoutes(env.ROUTES))) await store(env, src).sweep(src);
 }
 
 export function makeApi(token) {
@@ -286,12 +256,18 @@ export function store(env, chatId) {
     put: (entries) => call("put", { entries }),
     del: (keys) => call("del", { keys }),
     list: (prefix) => call("list", { prefix }),
+    sweep: (src) => call("sweep", { src }),
   };
 }
 
+async function deleteKeys(storage, keys) {
+  for (let i = 0; i < keys.length; i += 128) await storage.delete(keys.slice(i, i + 128));
+}
+
 export class Store {
-  constructor(state) {
+  constructor(state, env) {
     this.storage = state.storage;
+    this.env = env;
   }
 
   async fetch(request) {
@@ -301,10 +277,73 @@ export class Store {
     if (op === "list") {
       return Response.json(Object.fromEntries(await this.storage.list({ prefix: body.prefix })));
     }
+    if (op === "sweep") {
+      // start a sweep unless one is already running
+      const st = await this.storage.get("sweep");
+      if (!st || Date.now() - st.at > 60000) {
+        await this.storage.put("sweep", { src: body.src, before: null, at: Date.now() });
+        await this.storage.setAlarm(Date.now());
+      }
+      return Response.json({ ok: true });
+    }
     if (op === "put") await this.storage.put(body.entries);
-    else if (op === "del") await this.storage.delete(body.keys);
+    else if (op === "del") await deleteKeys(this.storage, body.keys);
     else return new Response("bad op", { status: 400 });
     return Response.json({ ok: true });
+  }
+
+  // One sweep batch: "edit" each original's buttons to exactly what they already
+  // are. Telegram answers "not modified" if the post exists, "not found" if it was
+  // deleted -> then delete its copies. Nothing visible changes.
+  async alarm() {
+    const st = await this.storage.get("sweep");
+    if (!st) return;
+    const api = this.api || makeApi(this.env.BOT_TOKEN);
+    const now = Date.now();
+
+    const recent = [...(await this.storage.list({ prefix: "r:" }))].map(([k, v]) => [Number(k.slice(2)), v]);
+    await deleteKeys(this.storage, recent.filter(([, v]) => now - v.t > RECENT_MS).map(([id]) => `r:${id}`));
+    const todo = recent
+      .filter(([id, v]) => now - v.t <= RECENT_MS && (st.before == null || id < st.before))
+      .sort((a, b) => b[0] - a[0]); // newest first
+    const batch = todo.slice(0, SWEEP_BATCH);
+
+    const results = await Promise.all(
+      batch.map(([id, v]) =>
+        api("editMessageReplyMarkup", { chat_id: st.src, message_id: id, reply_markup: v.kb }),
+      ),
+    );
+    const gone = [];
+    let retryAfter = 0;
+    results.forEach((res, i) => {
+      if (res.ok) return;
+      if (/not found/i.test(res.description || "")) gone.push(batch[i][0]);
+      else if (res.error_code === 429) {
+        retryAfter = Math.max(retryAfter, (res.parameters && res.parameters.retry_after) || 5);
+      }
+    });
+
+    if (gone.length) {
+      const keys = gone.map((id) => `m:${id}`);
+      const found = await this.storage.get(keys);
+      const byChat = {};
+      for (const k of keys) for (const c of found.get(k) || []) (byChat[c.chat] ||= []).push(c.id);
+      for (const [chat, ids] of Object.entries(byChat)) {
+        await api("deleteMessages", { chat_id: chat, message_ids: ids });
+      }
+      await deleteKeys(this.storage, [...keys, ...gone.map((id) => `r:${id}`), ...gone.map((id) => `g:${id}`)]);
+    }
+
+    if (retryAfter) {
+      // Telegram says slow down: redo this batch later
+      await this.storage.put("sweep", { ...st, at: Date.now() + retryAfter * 1000 });
+      await this.storage.setAlarm(Date.now() + retryAfter * 1000);
+    } else if (todo.length > batch.length) {
+      await this.storage.put("sweep", { ...st, before: batch[batch.length - 1][0], at: Date.now() });
+      await this.storage.setAlarm(Date.now() + SWEEP_GAP_MS);
+    } else {
+      await this.storage.delete("sweep");
+    }
   }
 }
 

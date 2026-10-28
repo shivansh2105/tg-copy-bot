@@ -15,16 +15,22 @@ const api = async (m, b) => {
 
 function makeStorage() {
   const m = new Map();
-  return {
+  const s = {
+    alarm: null,
     get: async (k) => Array.isArray(k)
       ? new Map(k.filter((x) => m.has(x)).map((x) => [x, structuredClone(m.get(x))]))
       : structuredClone(m.get(k)),
-    put: async (o) => { for (const [k, v] of Object.entries(o)) m.set(k, structuredClone(v)); },
-    delete: async (ks) => ks.forEach((k) => m.delete(k)),
+    put: async (o, v) => {
+      if (typeof o === "string") return void m.set(o, structuredClone(v));
+      for (const [k, val] of Object.entries(o)) m.set(k, structuredClone(val));
+    },
+    delete: async (ks) => [].concat(ks).forEach((k) => m.delete(k)),
     deleteAll: async () => m.clear(),
     list: async ({ prefix }) => new Map([...m].filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k, structuredClone(v)])),
-    setAlarm: async () => {},
+    setAlarm: async (t) => { s.alarm = t; },
+    getAlarm: async () => s.alarm,
   };
+  return s;
 }
 function ns(Cls) {
   const objs = new Map();
@@ -97,13 +103,54 @@ const cronApi = async (m, b) => {
   }
   return { ok: true };
 };
-await checkDeleted(env, cronApi);
+// run the cron + all follow-up alarm batches of the store object
+const storeObj = () => env.STORE.objs.get(`map:${SRC}`);
+async function runSweep(apiFn) {
+  storeObj().api = apiFn;
+  await checkDeleted(env);
+  let runs = 0;
+  while (storeObj().storage.alarm !== null && runs < 100) {
+    storeObj().storage.alarm = null;
+    await storeObj().alarm();
+    runs++;
+  }
+  return runs;
+}
+await runSweep(cronApi);
 const checks = calls.filter(([m]) => m === "editMessageReplyMarkup");
 assert.deepStrictEqual(checks.map(([, b]) => b.message_id), [41, 40, 11]); // newest first (11 = photo from step 3)
 assert.deepStrictEqual(checks[0][1].reply_markup, { inline_keyboard: [] }); // buttons preserved
 assert.deepStrictEqual(calls.find(([m]) => m === "deleteMessages"), ["deleteMessages", { chat_id: DST, message_ids: [copy41] }]);
 calls.length = 0;
-await checkDeleted(env, cronApi); // 41 forgotten, 41 forgotten
+await runSweep(cronApi); // 41 forgotten
 assert.deepStrictEqual(calls.map(([, b]) => b.message_id), [40, 11]);
+calls.length = 0;
+
+// 9. 100 more posts -> all checked across several batches (not just 40)
+for (let id = 100; id < 200; id++) await handleUpdate({ channel_post: { message_id: id, chat: chan, text: "p" + id } }, env, api);
+calls.length = 0;
+const runs = await runSweep(cronApi);
+const checked = calls.filter(([m]) => m === "editMessageReplyMarkup").map(([, b]) => b.message_id);
+assert.strictEqual(checked.length, 102); // 100 new + 40 + 11
+assert.strictEqual(new Set(checked).size, 102);
+assert.strictEqual(runs, 3); // 40 + 40 + 22
+calls.length = 0;
+
+// 10. Telegram rate limit (429) -> batch retried later, nothing wrongly deleted
+let limited = true;
+const rlApi = async (m, b) => {
+  if (limited) return calls.push([m, b]), { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 3 } };
+  return cronApi(m, b);
+};
+storeObj().api = rlApi;
+await checkDeleted(env);
+storeObj().storage.alarm = null;
+await storeObj().alarm();
+assert.ok(storeObj().storage.alarm >= Date.now() + 2000, "retry scheduled after retry_after");
+assert.ok(!calls.some(([m]) => m === "deleteMessages"));
+limited = false;
+calls.length = 0;
+await runSweep(rlApi);
+assert.strictEqual(calls.filter(([m]) => m === "editMessageReplyMarkup").length, 102);
 
 console.log("sync tests passed");
