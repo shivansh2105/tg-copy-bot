@@ -152,18 +152,40 @@ export async function handleUpdate(update, env, api) {
     const stub = env.ALBUMS.get(env.ALBUMS.idFromName(key));
     await stub.fetch("https://album/add", {
       method: "POST",
-      body: JSON.stringify({ chatId, messageId: msg.message_id }),
+      body: JSON.stringify({
+        chatId,
+        messageId: msg.message_id,
+        replyTo: msg.reply_to_message && msg.reply_to_message.message_id,
+        item: albumItem(msg),
+      }),
     });
     return;
   }
 
+  // If this post is a reply, find the copy of the replied-to post in each destination
+  const replyMap = await replyTargets(msg.reply_to_message && msg.reply_to_message.message_id, chatId, env);
+
   const copies = [];
   for (const dest of dests) {
-    const res = await api("copyMessage", {
-      chat_id: dest,
-      from_chat_id: msg.chat.id,
-      message_id: msg.message_id,
-    });
+    const body = { chat_id: dest, from_chat_id: msg.chat.id, message_id: msg.message_id };
+    let res;
+    if (replyMap[dest]) {
+      const rp = { message_id: replyMap[dest], allow_sending_without_reply: true };
+      if (msg.quote && msg.quote.is_manual) {
+        // keep a partial quote ("reply with quote") if Telegram accepts it
+        res = await api("copyMessage", {
+          ...body,
+          reply_parameters: {
+            ...rp,
+            quote: msg.quote.text,
+            quote_entities: msg.quote.entities,
+            quote_position: msg.quote.position,
+          },
+        });
+      }
+      if (!res || !res.ok) res = await api("copyMessage", { ...body, reply_parameters: rp });
+    }
+    if (!res || !res.ok) res = await api("copyMessage", body);
     if (res.ok && res.result) copies.push({ chat: dest, id: res.result.message_id });
   }
   if (copies.length && env.STORE) {
@@ -243,6 +265,29 @@ async function deleteCopies(msg, arg, env, api) {
   // remove the original post(s) and the /del command itself
   await api("deleteMessages", { chat_id: msg.chat.id, message_ids: [...srcIds, msg.message_id] });
   await s.del([...keys, ...srcIds.map((id) => `g:${id}`), ...srcIds.map((id) => `r:${id}`)]);
+}
+
+// Replied-to source post -> { destChat: copyMessageId }
+async function replyTargets(srcId, chatId, env) {
+  if (!srcId || !env.STORE) return {};
+  const key = `m:${srcId}`;
+  const copies = (await store(env, chatId).get([key]))[key] || [];
+  return Object.fromEntries(copies.map((c) => [String(c.chat), c.id]));
+}
+
+// What sendMediaGroup needs to re-post one album item (only used for album replies)
+function albumItem(msg) {
+  const type = ["photo", "video", "document", "audio"].find((t) => msg[t]);
+  if (!type) return null;
+  const m = msg[type];
+  return {
+    type,
+    media: Array.isArray(m) ? m[m.length - 1].file_id : m.file_id,
+    caption: msg.caption,
+    caption_entities: msg.caption_entities,
+    show_caption_above_media: msg.show_caption_above_media,
+    has_spoiler: msg.has_media_spoiler,
+  };
 }
 
 // Small key-value store (one Durable Object per source chat) that remembers
@@ -356,10 +401,14 @@ export class AlbumBuffer {
   }
 
   async fetch(request) {
-    const { chatId, messageId } = await request.json();
+    const { chatId, messageId, replyTo, item } = await request.json();
     const ids = (await this.state.storage.get("ids")) || [];
     if (!ids.includes(messageId)) ids.push(messageId);
-    await this.state.storage.put({ ids, chatId });
+    const items = (await this.state.storage.get("items")) || {};
+    items[messageId] = item || null;
+    const entries = { ids, chatId, items };
+    if (replyTo) entries.replyTo = replyTo;
+    await this.state.storage.put(entries);
     // restart the timer on every new photo; fires when the album is complete
     await this.state.storage.setAlarm(Date.now() + ALBUM_WAIT_MS);
     return new Response("queued");
@@ -368,17 +417,33 @@ export class AlbumBuffer {
   async alarm() {
     const ids = ((await this.state.storage.get("ids")) || []).sort((a, b) => a - b);
     const chatId = await this.state.storage.get("chatId");
+    const items = (await this.state.storage.get("items")) || {};
+    const replyTo = await this.state.storage.get("replyTo");
     await this.state.storage.deleteAll();
     if (!ids.length || !chatId) return;
     const api = this.api || makeApi(this.env.BOT_TOKEN);
+    const replyMap = await replyTargets(replyTo, chatId, this.env);
+    const media = ids.map((id) => items[id]);
+    const canResend = media.every(Boolean);
 
     const results = [];
     for (const dest of parseRoutes(this.env.ROUTES)[chatId] || []) {
-      const res = await api("copyMessages", {
-        chat_id: dest,
-        from_chat_id: Number(chatId),
-        message_ids: ids,
-      });
+      let res;
+      // copyMessages can't reply, so a reply-album is re-sent by file_id instead
+      if (replyMap[dest] && canResend) {
+        res = await api("sendMediaGroup", {
+          chat_id: dest,
+          media,
+          reply_parameters: { message_id: replyMap[dest], allow_sending_without_reply: true },
+        });
+      }
+      if (!res || !res.ok) {
+        res = await api("copyMessages", {
+          chat_id: dest,
+          from_chat_id: Number(chatId),
+          message_ids: ids,
+        });
+      }
       if (res.ok && Array.isArray(res.result)) results.push([dest, res.result]);
     }
 

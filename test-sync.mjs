@@ -152,5 +152,30 @@ limited = false;
 calls.length = 0;
 await runSweep(rlApi);
 assert.strictEqual(calls.filter(([m]) => m === "editMessageReplyMarkup").length, 102);
+calls.length = 0;
+
+// 11. reply -> copy is a reply to the copy of the original
+await handleUpdate({ channel_post: { message_id: 300, chat: chan, text: "question" } }, env, api);
+const copy300 = nextId - 1;
+await handleUpdate({ channel_post: { message_id: 301, chat: chan, text: "answer", reply_to_message: { message_id: 300 } } }, env, api);
+assert.deepStrictEqual(calls.pop(), ["copyMessage", {
+  chat_id: DST, from_chat_id: SRC, message_id: 301,
+  reply_parameters: { message_id: copy300, allow_sending_without_reply: true },
+}]);
+// reply to a post the bot never copied -> plain copy
+await handleUpdate({ channel_post: { message_id: 302, chat: chan, text: "x", reply_to_message: { message_id: 1 } } }, env, api);
+assert.deepStrictEqual(calls.pop(), ["copyMessage", { chat_id: DST, from_chat_id: SRC, message_id: 302 }]);
+
+// 12. album sent as a reply -> sendMediaGroup with reply_parameters
+calls.length = 0;
+for (const id of [311, 310]) {
+  await handleUpdate({ channel_post: { message_id: id, media_group_id: "R1", chat: chan, photo: [{ file_id: "s" }, { file_id: "big" + id }], caption: id === 310 ? "cap" : undefined, reply_to_message: { message_id: 300 } } }, env, api);
+}
+await env.ALBUMS.objs.get(`${SRC}:R1`).alarm();
+const smg = calls.find(([m]) => m === "sendMediaGroup");
+assert.ok(smg, "album reply uses sendMediaGroup");
+assert.deepStrictEqual(smg[1].reply_parameters, { message_id: copy300, allow_sending_without_reply: true });
+assert.deepStrictEqual(smg[1].media.map((x) => x.media), ["big310", "big311"]);
+assert.strictEqual(smg[1].media[0].caption, "cap");
 
 console.log("sync tests passed");

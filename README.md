@@ -43,6 +43,7 @@ Done. Post in Group A/B → appears in the channel with no sender name.
 | Reply `/del` to a post | copy **and** original (and the /del message) are deleted |
 | `/del <post link>` | same, if you can't reply |
 | Delete normally | copy is deleted within ~1 minute (auto-check, see below) |
+| Reply to a post | the copy is also a reply to that post's copy (albums too) |
 
 **Auto-check:** Telegram does not tell bots about deletions, so a free Cloudflare cron runs every minute and checks **all** originals from the last 48 h (in batches of 40, each batch a separate free run; it backs off automatically if Telegram rate-limits). It does this by "editing" each original's buttons to exactly what they already are: Telegram replies "not modified" (still there) or "not found" (deleted). Nothing visible changes. Needs **Edit messages of others** permission in the source channel.
 
